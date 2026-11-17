@@ -29,6 +29,7 @@ type Request struct {
 type Plan struct {
 	Access     string `json:"access"`
 	Index      string `json:"index,omitempty"`
+	IndexReady uint64 `json:"index_ready,omitempty"`
 	Candidates int    `json:"candidates"`
 	Snapshot   uint64 `json:"snapshot"`
 	Residuals  int    `json:"residuals"`

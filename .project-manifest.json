@@ -368,6 +368,58 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "online-index-build",
+      "name": "online index build over a continuously written relation",
+      "entry": "POST /indexes with online build policy",
+      "steps": [
+        "transport",
+        "engine",
+        "catalog",
+        "index",
+        "versions",
+        "journal",
+        "query"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "catalog",
+        "index",
+        "versions",
+        "journal",
+        "query"
+      ],
+      "success": "build completes under concurrent writes and becomes queryable at its ready sequence",
+      "failure": "duplicate values fail only the build; lag policy blocks commits or fails the build explicitly",
+      "verification": "python3 examples/walkthrough.py --workflow online-index-build"
+    },
+    {
+      "id": "online-index-restart",
+      "name": "interrupted online index build resumes after restart and restore",
+      "entry": "POST /indexes then restart or backup-restore mid-build",
+      "steps": [
+        "transport",
+        "engine",
+        "catalog",
+        "index",
+        "versions",
+        "journal",
+        "snapshot"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "catalog",
+        "index",
+        "versions",
+        "journal",
+        "snapshot"
+      ],
+      "success": "building state survives restart and restore; the build resumes and reaches the same terminal state",
+      "failure": "ready terminal state must survive checkpoint restart",
+      "verification": "python3 examples/walkthrough.py --workflow online-index-restart"
     }
   ],
   "complexity": {

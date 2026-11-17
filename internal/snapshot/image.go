@@ -88,6 +88,22 @@ func Validate(image Image) error {
 		if _, ok := relation.Column(definition.Column); !ok {
 			return fmt.Errorf("invalid index column")
 		}
+		switch definition.State {
+		case "", "active":
+			if definition.Ready > image.Sequence || definition.Ready != 0 && definition.Ready < definition.Created {
+				return fmt.Errorf("invalid index ready sequence")
+			}
+		case "building":
+			if definition.Ready != 0 || !definition.Online || definition.Build == nil {
+				return fmt.Errorf("invalid building index metadata")
+			}
+		case "failed":
+			if definition.Ready != 0 {
+				return fmt.Errorf("invalid failed index metadata")
+			}
+		default:
+			return fmt.Errorf("invalid index state")
+		}
 	}
 	for name, rows := range image.Store.Tables {
 		r, ok := image.Catalog.Relations[name]
@@ -114,7 +130,7 @@ func Validate(image Image) error {
 		}
 	}
 	for _, definition := range image.Catalog.Indexes {
-		if !definition.Unique {
+		if !definition.Unique || !definition.Active() {
 			continue
 		}
 		seen := map[string]bool{}

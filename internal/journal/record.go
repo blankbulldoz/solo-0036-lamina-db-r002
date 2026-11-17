@@ -14,4 +14,5 @@ type Record struct {
 	Index       *catalog.Index      `json:"index,omitempty"`
 	Writes      []versions.Mutation `json:"writes,omitempty"`
 	Horizon     uint64              `json:"horizon,omitempty"`
+	Detail      string              `json:"detail,omitempty"`
 }

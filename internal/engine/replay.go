@@ -30,7 +30,59 @@ func (d *DB) apply(r journal.Record) error {
 		if err := d.catalog.CheckIndex(*r.Index); err != nil {
 			return err
 		}
-		d.catalog.Indexes[r.Index.Name] = *r.Index
+		definition := *r.Index
+		if definition.State == "" {
+			definition.State = "active"
+		}
+		if definition.State != "active" {
+			return fmt.Errorf("invalid index record state")
+		}
+		if definition.Ready == 0 {
+			definition.Ready = definition.Created
+		}
+		d.catalog.Indexes[definition.Name] = definition
+	case "index_build":
+		if r.Index == nil || r.Index.Created != r.Sequence || !r.Index.Online || r.Index.Build == nil {
+			return fmt.Errorf("invalid index build record")
+		}
+		if err := d.catalog.CheckIndex(*r.Index); err != nil {
+			return err
+		}
+		for _, existing := range d.catalog.Indexes {
+			if existing.State == "building" {
+				return fmt.Errorf("concurrent index builds in journal")
+			}
+		}
+		definition := *r.Index
+		definition.State = "building"
+		definition.Ready = 0
+		definition.Error = ""
+		d.catalog.Indexes[definition.Name] = definition
+	case "index_ready":
+		if r.Index == nil {
+			return fmt.Errorf("invalid index ready record")
+		}
+		definition, ok := d.catalog.Indexes[r.Index.Name]
+		if !ok || definition.State != "building" {
+			return fmt.Errorf("index not building")
+		}
+		definition.State = "active"
+		definition.Ready = r.Sequence
+		d.catalog.Indexes[definition.Name] = definition
+	case "index_failed":
+		if r.Index == nil {
+			return fmt.Errorf("invalid index failed record")
+		}
+		definition, ok := d.catalog.Indexes[r.Index.Name]
+		if !ok || definition.State != "building" {
+			return fmt.Errorf("index not building")
+		}
+		definition.State = "failed"
+		definition.Error = r.Detail
+		if definition.Error == "" {
+			definition.Error = "index build failed"
+		}
+		d.catalog.Indexes[definition.Name] = definition
 	case "commit":
 		seen := map[string]bool{}
 		for _, m := range r.Writes {

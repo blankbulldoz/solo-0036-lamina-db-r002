@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','online-index-build','online-index-restart']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -40,6 +40,15 @@ class Session:
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
  if not condition:raise RuntimeError(message)
+def index_entry(s,name):
+ return next(i for i in s.call('GET','/catalog')['indexes'] if i['name']==name)
+def wait_index(s,name,timeout):
+ deadline=time.monotonic()+timeout
+ while time.monotonic()<deadline:
+  entry=index_entry(s,name)
+  if entry['state']!='building':return entry
+  time.sleep(.05)
+ return index_entry(s,name)
 def tuple_(n,band=None,amplitude=None):return {'sample':n,'band':band or f'b{n}','amplitude':n*10 if amplitude is None else amplitude,'valid':True}
 def seed(s):
  schema={'name':'spectra','primary':'sample','columns':[{'name':'sample','type':'int'},{'name':'band','type':'text'},{'name':'amplitude','type':'int','nullable':True},{'name':'valid','type':'bool'}]}
@@ -152,6 +161,104 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='online-index-build':
+    tx=s.begin()
+    for n in range(100,340):s.put(tx,tuple_(n,amplitude=n))
+    s.commit(tx)
+    policy={'batch':4,'interval_ms':50,'max_lag':100000,'on_lag':'block'}
+    created=s.call('POST','/indexes',{'name':'online_amp','relation':'spectra','column':'amplitude','online':True,'build':policy},201)
+    require(created['state']=='building','online build did not start in building state')
+    def writer():
+     for base in range(400,430,3):
+      wtx=s.begin()
+      for n in range(base,base+3):s.put(wtx,tuple_(n,amplitude=n))
+      s.commit(wtx);time.sleep(.05)
+    progress={}
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+     job=pool.submit(writer)
+     deadline=time.monotonic()+30
+     while time.monotonic()<deadline:
+      entry=index_entry(s,'online_amp')
+      if entry['state']=='building':
+       progress=s.stats().get('build') or progress
+       q=s.query(where=[{'column':'amplitude','op':'=','value':150}])
+       require(q['plan']['access']=='scan','building index served a query as complete')
+       require(q['matched']==1,'committed row missing during build')
+      if entry['state']=='active':break
+      time.sleep(.05)
+     job.result()
+    entry=index_entry(s,'online_amp')
+    require(entry['state']=='active' and entry['ready']>=entry['created'],'build did not reach active')
+    require(progress.get('backfill_total')==247 and 'lag' in progress,'build progress not observable in stats')
+    fast=s.query(where=[{'column':'amplitude','op':'=','value':415}])
+    slow=s.query(force_scan=True,where=[{'column':'amplitude','op':'=','value':415}])
+    require(fast['plan']['access']=='index' and fast['plan']['index_ready']==entry['ready'],'ready index not chosen')
+    require(fast['rows']==slow['rows'] and fast['matched']==1,'mid-build commit missing from index')
+    past=s.query(at=created['created'],where=[{'column':'amplitude','op':'=','value':150}])
+    require(past['plan']['access']=='scan' and past['matched']==1,'snapshot before ready used the index')
+    page=s.call('GET',f'/changes?after={seed_seq}&limit=1000')
+    kinds={r['kind']:r for r in page['records'] if (r.get('index') or {}).get('name')=='online_amp'}
+    require('index_build' in kinds and 'index_ready' in kinds,'lifecycle missing from changes')
+    require(kinds['index_ready']['sequence']==entry['ready'],'ready sequence disagrees with catalog')
+    tx=s.begin();s.put(tx,tuple_(901,band='dup'));s.put(tx,tuple_(902,band='dup'));s.commit(tx)
+    s.call('POST','/indexes',{'name':'online_band','relation':'spectra','column':'band','unique':True,'online':True,'build':policy},201)
+    entry=wait_index(s,'online_band',30)
+    require(entry['state']=='failed' and 'unique' in entry['error'],'historical duplicates did not fail the build')
+    require(s.query(where=[{'column':'band','op':'=','value':'dup'}])['matched']==2,'committed rows were rolled back')
+    tx=s.begin()
+    for n in (901,902):s.call('POST',f'/transactions/{tx}/delete',{'relation':'spectra','key':n})
+    s.commit(tx)
+    s.call('POST','/indexes',{'name':'online_band2','relation':'spectra','column':'band','unique':True,'online':True,'build':policy},201)
+    tx=s.begin();s.put(tx,tuple_(903,band='dup2'));s.commit(tx)
+    tx=s.begin();s.put(tx,tuple_(904,band='dup2'));s.commit(tx)
+    entry=wait_index(s,'online_band2',30)
+    require(entry['state']=='failed','concurrent duplicates did not fail the build')
+    require(s.query(where=[{'column':'band','op':'=','value':'dup2'}])['matched']==2,'concurrent commits were rolled back')
+    tx=s.begin()
+    for n in (903,904):s.call('POST',f'/transactions/{tx}/delete',{'relation':'spectra','key':n})
+    s.commit(tx)
+    s.call('POST','/indexes',{'name':'online_band','relation':'spectra','column':'band','unique':True,'online':True,'build':policy},201)
+    entry=wait_index(s,'online_band',30)
+    require(entry['state']=='active','retry of a failed name did not activate')
+    tx=s.begin();s.put(tx,tuple_(961,band='b1'));s.commit(tx,409)
+    s.call('POST','/indexes',{'name':'online_valid','relation':'spectra','column':'valid','online':True,'build':{'batch':4,'interval_ms':200,'max_lag':0,'on_lag':'fail'}},201)
+    entry={}
+    for n in range(970,995):
+     tx=s.begin();s.put(tx,tuple_(n));s.commit(tx)
+     entry=index_entry(s,'online_valid')
+     if entry['state']=='failed':break
+    require(entry['state']=='failed' and 'lag' in entry['error'],'lag policy did not fail the build explicitly')
+    require(s.query(where=[{'column':'sample','op':'=','value':970}])['matched']==1,'lag failure rolled back a commit')
+    observations={'ready':kinds['index_ready']['sequence'],'lifecycle':sorted(kinds),'lag_failure':entry['error']}
+   elif name=='online-index-restart':
+    tx=s.begin()
+    for n in range(100,340):s.put(tx,tuple_(n,amplitude=n))
+    s.commit(tx)
+    policy={'batch':4,'interval_ms':50,'max_lag':100000,'on_lag':'block'}
+    s.call('POST','/indexes',{'name':'online_amp','relation':'spectra','column':'amplitude','online':True,'build':policy},201)
+    time.sleep(.3)
+    require(index_entry(s,'online_amp')['state']=='building','build finished before interruption')
+    s.stop();s.start()
+    require(index_entry(s,'online_amp')['state']=='building','build state not durable across restart')
+    entry=wait_index(s,'online_amp',40)
+    require(entry['state']=='active','build did not resume and finish after restart')
+    q={'where':[{'column':'amplitude','op':'>=','value':330}]}
+    fast=s.query(**q);slow=s.query(force_scan=True,**q)
+    require(fast['plan']['access']=='index' and fast['rows']==slow['rows'],'resumed index diverges from scan')
+    s.call('POST','/checkpoint');s.stop();s.start()
+    require(index_entry(s,'online_amp')['state']=='active','ready state lost across checkpoint restart')
+    require(s.query(**q)['plan']['access']=='index','index not used after checkpoint restart')
+    s.call('POST','/indexes',{'name':'online_band','relation':'spectra','column':'band','online':True,'build':policy},201)
+    backup=s.call('GET','/backup',raw=True);path=temp/'midbuild.lmi';path.write_bytes(backup)
+    other=Session(binary,temp/'restored',path).start()
+    entry=wait_index(other,'online_band',40)
+    require(entry['state']=='active','restored instance did not finish the resumed build')
+    q2=other.query(where=[{'column':'band','op':'=','value':'b200'}])
+    require(q2['plan']['access']=='index' and q2['matched']==1,'restored build serves wrong rows')
+    base=other.stats()['history_base']
+    kinds=[r['kind'] for r in other.call('GET',f'/changes?after={base}&limit=1000')['records']]
+    require('index_ready' in kinds,'restored changes feed lacks the ready record')
+    observations={'ready_after_restart':index_entry(s,'online_amp')['ready'],'restored_ready':entry['ready'],'history_base':base}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

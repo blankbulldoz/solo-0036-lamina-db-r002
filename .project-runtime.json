@@ -62,6 +62,14 @@
     {
       "workflow_id": "statistics",
       "command": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "workflow_id": "online-index-build",
+      "command": "python3 examples/walkthrough.py --workflow online-index-build"
+    },
+    {
+      "workflow_id": "online-index-restart",
+      "command": "python3 examples/walkthrough.py --workflow online-index-restart"
     }
   ]
 }

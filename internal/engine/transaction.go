@@ -164,13 +164,22 @@ func (d *DB) Commit(id string) (Commit, error) {
 	}
 	defer delete(d.transactions, id)
 	writes := make([]versions.Mutation, 0)
+	for _, mutations := range tx.writes {
+		for _, m := range mutations {
+			writes = append(writes, m.Mutation)
+		}
+	}
+	if len(writes) > 0 {
+		if err = d.throttleCommit(writes); err != nil {
+			return Commit{}, err
+		}
+	}
 	for table, mutations := range tx.writes {
-		for key, m := range mutations {
+		for key := range mutations {
 			if d.store.Latest(table, key) > tx.Snapshot {
 				d.conflicts++
 				return Commit{}, fault("conflict", "write conflict on %s", table)
 			}
-			writes = append(writes, m.Mutation)
 		}
 		if err = d.unique(table, tx.writes); err != nil {
 			d.conflicts++

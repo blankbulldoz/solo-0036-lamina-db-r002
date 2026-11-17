@@ -19,7 +19,7 @@ func Choose(c *catalog.Catalog, registry *index.Registry, q Request, at uint64, 
 	var chosen []string
 	for _, name := range names {
 		definition := c.Indexes[name]
-		if definition.Relation != q.Relation || definition.Created > at {
+		if definition.Relation != q.Relation || !definition.Active() || definition.Ready > at {
 			continue
 		}
 		for _, p := range q.Where {
@@ -35,6 +35,7 @@ func Choose(c *catalog.Catalog, registry *index.Registry, q Request, at uint64, 
 			if len(candidates) < plan.Candidates || plan.Access == "scan" && len(candidates) == 0 {
 				plan.Access = "index"
 				plan.Index = name
+				plan.IndexReady = definition.Ready
 				plan.Candidates = len(candidates)
 				chosen = candidates
 			}

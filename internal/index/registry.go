@@ -10,6 +10,9 @@ type Registry struct{ Trees map[string]*Tree }
 func Build(c *catalog.Catalog, s *versions.Store) *Registry {
 	r := &Registry{Trees: map[string]*Tree{}}
 	for name, definition := range c.Indexes {
+		if !definition.Active() {
+			continue
+		}
 		tree := New()
 		for key, chain := range s.Tables[definition.Relation] {
 			for _, v := range chain {
@@ -28,8 +31,11 @@ func (r *Registry) Apply(c *catalog.Catalog, writes []versions.Mutation) {
 			continue
 		}
 		for name, i := range c.Indexes {
-			if i.Relation == m.Relation {
-				r.Trees[name].Add(m.Row[i.Column], m.Key)
+			if i.Relation != m.Relation || !i.Active() {
+				continue
+			}
+			if tree := r.Trees[name]; tree != nil {
+				tree.Add(m.Row[i.Column], m.Key)
 			}
 		}
 	}

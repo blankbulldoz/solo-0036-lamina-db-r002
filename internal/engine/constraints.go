@@ -11,7 +11,7 @@ func (d *DB) unique(table string, writes map[string]map[string]staged) error {
 	rows := d.store.Scan(table, d.sequence)
 	overlay(rows, writes, table)
 	for _, i := range d.catalog.Indexes {
-		if i.Relation == table && i.Unique {
+		if i.Relation == table && i.Unique && i.Active() {
 			if err := checkUnique(rows, i); err != nil {
 				return err
 			}
@@ -58,8 +58,30 @@ func (d *DB) CreateIndex(i catalog.Index) (catalog.Index, error) {
 	if err := d.usable(); err != nil {
 		return i, err
 	}
+	i.Created = 0
+	i.State = ""
+	i.Ready = 0
+	i.Error = ""
+	if i.Online && i.Build == nil {
+		i.Build = &catalog.BuildPolicy{}
+	}
+	if i.Build != nil {
+		i.Build.Defaults()
+	}
 	if err := d.catalog.CheckIndex(i); err != nil {
 		return i, invalid(err)
+	}
+	if i.Online {
+		if d.builder != nil {
+			return i, fault("conflict", "another index build is in progress")
+		}
+		i.Created = d.sequence + 1
+		i.State = "building"
+		if err := d.publish(journal.Record{Kind: "index_build", Index: &i}); err != nil {
+			return i, err
+		}
+		d.startBuilder(i)
+		return i, nil
 	}
 	if i.Unique {
 		if err := checkUnique(d.store.Scan(i.Relation, d.sequence), i); err != nil {
@@ -67,6 +89,8 @@ func (d *DB) CreateIndex(i catalog.Index) (catalog.Index, error) {
 		}
 	}
 	i.Created = d.sequence + 1
+	i.State = "active"
+	i.Ready = i.Created
 	if err := d.publish(journal.Record{Kind: "index", Index: &i}); err != nil {
 		return i, err
 	}

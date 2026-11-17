@@ -14,6 +14,7 @@ import (
 
 type DB struct {
 	mu           sync.RWMutex
+	cond         *sync.Cond
 	dir          string
 	catalog      *catalog.Catalog
 	store        *versions.Store
@@ -22,6 +23,7 @@ type DB struct {
 	sequence     uint64
 	horizon      uint64
 	transactions map[string]*Transaction
+	builder      *Builder
 	closed       bool
 	commits      uint64
 	conflicts    uint64
@@ -48,11 +50,21 @@ func Open(dir string) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d.cond = sync.NewCond(&d.mu)
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
 		d.sequence = image.Sequence
 		d.horizon = image.Horizon
+		for name, definition := range d.catalog.Indexes {
+			if definition.State == "" {
+				definition.State = "active"
+			}
+			if definition.State == "active" && definition.Ready == 0 {
+				definition.Ready = definition.Created
+			}
+			d.catalog.Indexes[name] = definition
+		}
 	}
 	last := w.Base + uint64(len(w.Records))
 	if d.sequence > last {
@@ -75,6 +87,12 @@ func Open(dir string) (*DB, error) {
 			return nil, fmt.Errorf("recovered constraints: %w", err)
 		}
 	}
+	for _, definition := range d.catalog.IndexList() {
+		if definition.State == "building" {
+			d.startBuilder(definition)
+			break
+		}
+	}
 	return d, nil
 }
 func (d *DB) usable() error {
@@ -88,11 +106,22 @@ func (d *DB) usable() error {
 }
 func (d *DB) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
+	builder := d.builder
+	if builder != nil {
+		close(builder.stop)
+	}
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	if builder != nil {
+		<-builder.done
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.transactions = map[string]*Transaction{}
 	return d.wal.Close()
 }
